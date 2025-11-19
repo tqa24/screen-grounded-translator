@@ -1,20 +1,28 @@
 [package]
-name = "screen-grounded-translator"
+name = "screen-translator"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-windows = { version = "0.58", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_Shell", "Win32_System_Threading"] }
-reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.11", features = ["json", "multipart"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-base64 = "0.22"
-tokio = { version = "1", features = ["full"] }
-image = "0.25"
-dirs = "5.0"
 anyhow = "1.0"
+base64 = "0.21"
+image = "0.24"
+dirs = "5.0"
 lazy_static = "1.4"
+textwrap = "0.16" # For smart text balancing
 
-[[bin]]
-name = "screen-grounded-translator"
-path = "src/main.rs"
+[dependencies.windows]
+version = "0.48" # or 0.52, code below uses 0.48 syntax mostly compatible
+features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemServices",
+    "Win32_Graphics_Dwm", # For blur effects
+]

@@ -1,352 +1,647 @@
+use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
+use std::io::{self, Write};
+use std::mem::size_of;
+
 use tokio::runtime::Runtime;
+use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::System::LibraryLoader::*;
-use windows::core::*;
-use windows::core::HSTRING;
+use windows::Win32::Graphics::Dwm::*;
+
 use serde::{Deserialize, Serialize};
 use base64::{Engine as _, engine::general_purpose};
-use image::ImageFormat;
+use image::{ImageBuffer, Rgba, ImageFormat, GenericImageView};
 use reqwest::Client;
 use lazy_static::lazy_static;
 use anyhow::Result;
-use std::io::{self, Write};
 
-#[derive(Serialize, Deserialize)]
-struct GroqResponse {
-    translation: String,
-    r#box: BoxCoords,
-}
-
-#[derive(Serialize, Deserialize)]
-struct BoxCoords {
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
-}
+// --- CONFIGURATION ---
 
 #[derive(Serialize, Deserialize, Clone)]
 struct Config {
     api_key: String,
     language: String,
-    hotkey: u32,
+    hotkey: u32, // Virtual Key Code
 }
 
-struct App {
-    config: Config,
-    runtime: Runtime,
-    client: Client,
+// --- API STRUCTS ---
+
+#[derive(Serialize, Deserialize, Debug)]
+struct GroqResponse {
+    translation: String,
 }
+
+// --- APPLICATION STATE ---
+
+struct AppState {
+    config: Config,
+    client: Client,
+    #[allow(dead_code)]
+    runtime: Runtime,
+    original_screenshot: Option<ImageBuffer<Rgba<u8>, Vec<u8>>>,
+    selection_rect: Option<RECT>,
+}
+
+lazy_static! {
+    static ref APP: Arc<Mutex<AppState>> = Arc::new(Mutex::new(load_app_state()));
+}
+
+fn load_app_state() -> AppState {
+    let config = load_config();
+    AppState {
+        config,
+        client: Client::new(),
+        runtime: Runtime::new().unwrap(),
+        original_screenshot: None,
+        selection_rect: None,
+    }
+}
+
+// --- HELPER: STRING TO WIDE (UTF-16) ---
+fn to_wstring(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+// --- CONFIG UTILS ---
 
 fn load_config() -> Config {
-    let config_dir = dirs::config_dir().unwrap().join("screen-grounded-translator");
+    let config_dir = dirs::config_dir().unwrap_or_default().join("screen-grounded-translator");
     let _ = std::fs::create_dir_all(&config_dir);
     let config_file = config_dir.join("config.json");
+
     if config_file.exists() {
         let data = std::fs::read_to_string(config_file).unwrap_or_default();
-        serde_json::from_str(&data).unwrap_or_else(|_| Config {
-            api_key: "".to_string(),
-            language: "Vietnamese".to_string(),
-            hotkey: VK_OEM_3.0 as u32,
-        })
+        serde_json::from_str(&data).unwrap_or(default_config())
     } else {
-        Config {
-            api_key: "".to_string(),
-            language: "Vietnamese".to_string(),
-            hotkey: VK_OEM_3.0 as u32,
-        }
+        default_config()
+    }
+}
+
+fn default_config() -> Config {
+    Config {
+        api_key: "".to_string(),
+        language: "Vietnamese".to_string(),
+        hotkey: VK_OEM_3.0 as u32, // Tilde key
     }
 }
 
 fn save_config(config: &Config) {
-    let config_dir = dirs::config_dir().unwrap().join("screen-grounded-translator");
-    let _ = std::fs::create_dir_all(&config_dir);
+    let config_dir = dirs::config_dir().unwrap_or_default().join("screen-grounded-translator");
     let config_file = config_dir.join("config.json");
-    let data = serde_json::to_string(config).unwrap();
+    let data = serde_json::to_string_pretty(config).unwrap();
     let _ = std::fs::write(config_file, data);
 }
 
-fn run_config_prompt() {
-    let config = load_config();
+fn prompt_user_config() {
+    let mut config = load_config();
+    println!("\n=== Setup ===");
+    
+    if config.api_key.is_empty() {
+        print!("Enter Groq API Key: ");
+        io::stdout().flush().unwrap();
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).unwrap();
+        config.api_key = input.trim().to_string();
+    }
 
-    println!("\n=== Screen Translator Configuration ===\n");
-
-    // API Key
-    println!("Current API Key: {}", if config.api_key.is_empty() { "[empty]" } else { "[set]" });
-    print!("Enter API Key (or press Enter to skip): ");
+    print!("Enter Target Language (Default: {}): ", config.language);
     io::stdout().flush().unwrap();
-    let mut api_key = String::new();
-    io::stdin().read_line(&mut api_key).unwrap();
-    let api_key = if api_key.trim().is_empty() {
-        config.api_key
-    } else {
-        api_key.trim().to_string()
-    };
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).unwrap();
+    if !input.trim().is_empty() {
+        config.language = input.trim().to_string();
+    }
 
-    // Language
-    println!("\nCurrent Language: {}", config.language);
-    println!("Available: Vietnamese, English, Korean");
-    print!("Enter language (or press Enter to keep): ");
-    io::stdout().flush().unwrap();
-    let mut language = String::new();
-    io::stdin().read_line(&mut language).unwrap();
-    let language = if language.trim().is_empty() {
-        config.language
-    } else {
-        language.trim().to_string()
-    };
-
-    // Hotkey
-    println!("\nCurrent Hotkey: {} (VK code)", config.hotkey);
-    print!("Enter hotkey code (or press Enter to keep): ");
-    io::stdout().flush().unwrap();
-    let mut hotkey_str = String::new();
-    io::stdin().read_line(&mut hotkey_str).unwrap();
-    let hotkey = if hotkey_str.trim().is_empty() {
-        config.hotkey
-    } else {
-        hotkey_str.trim().parse().unwrap_or(192)
-    };
-
-    let new_config = Config {
-        api_key,
-        language,
-        hotkey,
-    };
-
-    save_config(&new_config);
-    println!("\n✓ Config saved!");
+    save_config(&config);
+    println!("Configuration saved.\n");
 }
 
-lazy_static! {
-    static ref APP: Arc<Mutex<App>> = Arc::new(Mutex::new(App::new()));
+// --- SCREEN CAPTURE UTILS ---
+
+fn capture_full_screen() -> Result<(ImageBuffer<Rgba<u8>, Vec<u8>>, i32, i32)> {
+    unsafe {
+        let x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        let width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        let height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+
+        let hdc_screen = GetDC(None);
+        let hdc_mem = CreateCompatibleDC(hdc_screen);
+        let hbitmap = CreateCompatibleBitmap(hdc_screen, width, height);
+        SelectObject(hdc_mem, hbitmap);
+
+        BitBlt(hdc_mem, 0, 0, width, height, hdc_screen, x, y, SRCCOPY).ok()?;
+
+        let mut bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height, // Top-down
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0 as u32,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut buffer: Vec<u8> = vec![0; (width * height * 4) as usize];
+        GetDIBits(
+            hdc_mem,
+            hbitmap,
+            0,
+            height as u32,
+            Some(buffer.as_mut_ptr() as *mut _),
+            &mut bmi,
+            DIB_RGB_COLORS,
+        );
+
+        for chunk in buffer.chunks_exact_mut(4) {
+            chunk.swap(0, 2); // Swap B and R
+            chunk[3] = 255;   // Ensure alpha is opaque
+        }
+
+        DeleteObject(hbitmap);
+        DeleteDC(hdc_mem);
+        ReleaseDC(None, hdc_screen);
+
+        let img = ImageBuffer::from_raw(width as u32, height as u32, buffer)
+            .ok_or_else(|| anyhow::anyhow!("Failed to create image buffer"))?;
+
+        Ok((img, x, y))
+    }
 }
 
-impl App {
-    fn new() -> Self {
-        let runtime = Runtime::new().unwrap();
-        let client = Client::new();
-        let config = load_config();
-        Self {
-            config,
-            runtime,
-            client,
-        }
-    }
+// --- API LOGIC ---
 
-    fn capture_screenshot(&self) -> Result<String> {
-        unsafe {
-            let screen_dc = GetDC(None);
-            let width = GetSystemMetrics(SM_CXSCREEN);
-            let height = GetSystemMetrics(SM_CYSCREEN);
-            let mem_dc = CreateCompatibleDC(screen_dc);
-            let bitmap = CreateCompatibleBitmap(screen_dc, width, height);
-            let old_bitmap = SelectObject(mem_dc, bitmap);
-            BitBlt(mem_dc, 0, 0, width, height, screen_dc, 0, 0, SRCCOPY)?;
+async fn translate_region(
+    api_key: String,
+    target_lang: String,
+    image: ImageBuffer<Rgba<u8>, Vec<u8>>,
+) -> Result<String> {
+    let mut png_data = Vec::new();
+    image.write_to(&mut std::io::Cursor::new(&mut png_data), ImageFormat::Png)?;
+    let b64_image = general_purpose::STANDARD.encode(&png_data);
 
-            let mut bmi = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: width,
-                    biHeight: -height,
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB.0,
-                    biSizeImage: 0,
-                    biXPelsPerMeter: 0,
-                    biYPelsPerMeter: 0,
-                    biClrUsed: 0,
-                    biClrImportant: 0,
-                },
-                bmiColors: [RGBQUAD::default()],
-            };
+    let client = Client::new();
+    
+    let prompt = format!(
+        "Extract text from this image and translate it to {}. \
+        You must output valid JSON containing ONLY the key 'translation'. \
+        Example: {{ \"translation\": \"Xin chÃ o tháº¿ giá»›i\" }}",
+        target_lang
+    );
 
-            let mut buffer: Vec<u8> = vec![0; (width * height * 4) as usize];
-            GetDIBits(mem_dc, bitmap, 0, height as u32, Some(buffer.as_mut_ptr() as *mut std::ffi::c_void), &mut bmi, DIB_RGB_COLORS);
-
-            // BGRA to RGBA
-            for pixel in buffer.chunks_exact_mut(4) {
-                let b = pixel[0];
-                pixel[0] = pixel[2];
-                pixel[2] = b;
-            }
-
-            let img = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(width as u32, height as u32, buffer).unwrap();
-            let mut png_data = Vec::new();
-            img.write_to(&mut std::io::Cursor::new(&mut png_data), ImageFormat::Png)?;
-            let base64 = general_purpose::STANDARD.encode(&png_data);
-
-            SelectObject(mem_dc, old_bitmap);
-            let _ = DeleteObject(bitmap);
-            let _ = DeleteDC(mem_dc);
-            ReleaseDC(None, screen_dc);
-
-            Ok(base64)
-        }
-    }
-
-    fn get_cursor_pos(&self) -> (i32, i32) {
-        unsafe {
-            let mut point = POINT::default();
-            let _ = GetCursorPos(&mut point);
-            (point.x, point.y)
-        }
-    }
-
-    async fn call_groq(&self, base64_img: String, cursor_x: i32, cursor_y: i32) -> Result<GroqResponse> {
-        let prompt = format!("Based on the cursor position at ({}, {}), guess the intended text region on the screen that the user wants translated. Extract the text from that region and translate it to {}. Return the translation and the bounding box coordinates of the text region in JSON format with keys 'translation' and 'box' where 'box' has 'x', 'y', 'width', 'height'.", cursor_x, cursor_y, self.config.language);
-
-        let request = serde_json::json!({
-            "model": "meta-llama/llama-4-scout-17b-16e-instruct",
-            "messages": [{
+    let payload = serde_json::json!({
+        "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+        "messages": [
+            {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": &prompt},
-                    {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{}", base64_img)}}
+                    { "type": "text", "text": prompt },
+                    { "type": "image_url", "image_url": { "url": format!("data:image/png;base64,{}", b64_image) } }
                 ]
-            }],
-            "response_format": {"type": "json_object"},
-            "temperature": 0.1,
-            "max_completion_tokens": 1024
-        });
+            }
+        ],
+        "temperature": 0.1,
+        "max_completion_tokens": 1024,
+        "response_format": { "type": "json_object" }
+    });
 
-        let response = self.client
-            .post("https://api.groq.com/openai/v1/chat/completions")
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .header("Content-Type", "application/json")
-            .json(&request)
-            .send()
-            .await?;
+    let resp = client.post("https://api.groq.com/openai/v1/chat/completions")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .json(&payload)
+        .send()
+        .await?;
 
-        let status = response.status();
-        let text = response.text().await?;
-        
-        if !status.is_success() {
-            return Err(anyhow::anyhow!("API Error ({}): {}", status, text));
-        }
+    let status = resp.status();
+    let text_resp = resp.text().await?;
 
-        let json: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|e| anyhow::anyhow!("Failed to parse response: {}. Response was: {}", e, text))?;
-        
-        let content = json["choices"][0]["message"]["content"].as_str()
-            .ok_or_else(|| anyhow::anyhow!("No content in response. Full response: {}", json))?;
-        let resp: GroqResponse = serde_json::from_str(content)?;
-        Ok(resp)
+    if !status.is_success() {
+        return Err(anyhow::anyhow!("API Error ({}): {}", status, text_resp));
     }
 
-    fn run(app: Arc<Mutex<App>>) -> Result<()> {
-        unsafe {
-            let instance = GetModuleHandleW(None)?;
-            let class_name = s!("ScreenTranslatorClass");
+    let json_resp: serde_json::Value = serde_json::from_str(&text_resp)
+        .map_err(|e| anyhow::anyhow!("Failed to parse API JSON: {}. Body: {}", e, text_resp))?;
+        
+    let content_str = json_resp["choices"][0]["message"]["content"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("No content in response: {}", text_resp))?;
 
-            let wc = WNDCLASSA {
-                style: CS_HREDRAW | CS_VREDRAW,
-                lpfnWndProc: Some(wnd_proc),
-                cbClsExtra: 0,
-                cbWndExtra: 0,
-                hInstance: instance.into(),
-                hIcon: HICON::default(),
-                hCursor: LoadCursorW(None, IDC_ARROW)?,
-                hbrBackground: HBRUSH::default(),
-                lpszMenuName: PCSTR::null(),
-                lpszClassName: class_name,
-            };
-
-            RegisterClassA(&wc);
-
-            let hwnd = CreateWindowExA(
-                WINDOW_EX_STYLE::default(),
-                class_name,
-                s!("Screen Translator"),
-                WS_OVERLAPPEDWINDOW,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                400,
-                300,
-                None,
-                None,
-                instance,
-                None,
-            )?;
-
-            let _ = ShowWindow(hwnd, SW_SHOW);
-
-            // Register hotkey
-            let hotkey = app.lock().unwrap().config.hotkey;
-            println!("Registering hotkey: {}", hotkey);
-            match RegisterHotKey(hwnd, 1, HOT_KEY_MODIFIERS(0), hotkey) {
-                Ok(_) => println!("Hotkey registered successfully"),
-                Err(e) => {
-                    eprintln!("Failed to register hotkey: {:?}", e);
-                    return Err(e.into());
-                }
-            }
-
-            let mut msg = MSG::default();
-            while GetMessageA(&mut msg, None, 0, 0).into() {
-                let _ = TranslateMessage(&msg);
-                DispatchMessageA(&msg);
-            }
-
-            Ok(())
-        }
-    }
+    let groq_resp: GroqResponse = serde_json::from_str(content_str)
+        .map_err(|e| anyhow::anyhow!("LLM returned invalid JSON content: {}. Content: {}", e, content_str))?;
+    
+    Ok(groq_resp.translation)
 }
 
-unsafe extern "system" fn wnd_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
+// --- WINDOW PROCEDURES ---
+
+static mut START_POS: POINT = POINT { x: 0, y: 0 };
+static mut CURR_POS: POINT = POINT { x: 0, y: 0 };
+static mut IS_DRAGGING: bool = false;
+static mut SCREEN_OFFSET_X: i32 = 0;
+static mut SCREEN_OFFSET_Y: i32 = 0;
+
+unsafe extern "system" fn selection_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
-        WM_HOTKEY => {
-            if wparam.0 == 1 {
-                let app_clone = Arc::clone(&APP);
-                std::thread::spawn(move || {
-                    let rt = Runtime::new().unwrap();
-                    rt.block_on(async {
-                        match app_clone.lock().unwrap().capture_screenshot() {
-                            Ok(screenshot) => {
-                                let (x, y) = app_clone.lock().unwrap().get_cursor_pos();
-                                match app_clone.lock().unwrap().call_groq(screenshot, x, y).await {
-                                    Ok(resp) => {
-                                        let text = HSTRING::from(&format!("Translation: {}", resp.translation));
-                                        unsafe { MessageBoxW(None, &text, w!("Result"), MB_OK); }
-                                    }
-                                    Err(e) => {
-                                        let err_text = HSTRING::from(&format!("Error: {}", e));
-                                        unsafe { MessageBoxW(None, &err_text, w!("Error"), MB_OK); }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                let err_text = HSTRING::from(&format!("Screenshot failed: {}", e));
-                                unsafe { MessageBoxW(None, &err_text, w!("Error"), MB_OK); }
-                            }
-                        }
-                    });
-                });
+        WM_CREATE => {
+            SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+            LRESULT(0)
+        }
+        WM_KEYDOWN => {
+            if wparam.0 == VK_ESCAPE.0 as usize {
+                PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
             }
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN => {
+            IS_DRAGGING = true;
+            // Fix: Use addr_of_mut! to avoid mutable reference warnings
+            GetCursorPos(std::ptr::addr_of_mut!(START_POS));
+            CURR_POS = START_POS;
+            SetCapture(hwnd);
+            InvalidateRect(hwnd, None, false);
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            if IS_DRAGGING {
+                // Fix: Use addr_of_mut! to avoid mutable reference warnings
+                GetCursorPos(std::ptr::addr_of_mut!(CURR_POS));
+                InvalidateRect(hwnd, None, false);
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            if IS_DRAGGING {
+                IS_DRAGGING = false;
+                ReleaseCapture();
+                ShowWindow(hwnd, SW_HIDE); 
+
+                let rect = RECT {
+                    left: START_POS.x.min(CURR_POS.x),
+                    top: START_POS.y.min(CURR_POS.y),
+                    right: START_POS.x.max(CURR_POS.x),
+                    bottom: START_POS.y.max(CURR_POS.y),
+                };
+
+                if (rect.right - rect.left) > 10 && (rect.bottom - rect.top) > 10 {
+                    let mut app = APP.lock().unwrap();
+                    app.selection_rect = Some(rect);
+                    
+                    let app_clone = APP.clone();
+                    std::thread::spawn(move || process_selection(app_clone, rect));
+                } else {
+                     PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+                }
+            }
+            LRESULT(0)
+        }
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            
+            let mem_dc = CreateCompatibleDC(hdc);
+            let width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            let height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            let mem_bitmap = CreateCompatibleBitmap(hdc, width, height);
+            SelectObject(mem_dc, mem_bitmap);
+
+            // Use GDI to darken the background to simulate dimming
+            let brush = CreateSolidBrush(COLORREF(0x00000000)); // Black
+            let full_rect = RECT { left: 0, top: 0, right: width, bottom: height };
+            FillRect(mem_dc, &full_rect, brush);
+            DeleteObject(brush);
+
+            if IS_DRAGGING {
+                let rect = RECT {
+                    left: (START_POS.x.min(CURR_POS.x)) - SCREEN_OFFSET_X,
+                    top: (START_POS.y.min(CURR_POS.y)) - SCREEN_OFFSET_Y,
+                    right: (START_POS.x.max(CURR_POS.x)) - SCREEN_OFFSET_X,
+                    bottom: (START_POS.y.max(CURR_POS.y)) - SCREEN_OFFSET_Y,
+                };
+                
+                let frame_brush = CreateSolidBrush(COLORREF(0x00FFFFFF)); // White
+                FrameRect(mem_dc, &rect, frame_brush);
+                DeleteObject(frame_brush);
+            }
+
+            BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY).ok().unwrap();
+            
+            DeleteObject(mem_bitmap);
+            DeleteDC(mem_dc);
+            EndPaint(hwnd, &mut ps);
             LRESULT(0)
         }
         WM_DESTROY => {
             PostQuitMessage(0);
             LRESULT(0)
         }
-        _ => DefWindowProcA(hwnd, msg, wparam, lparam),
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
 
+unsafe extern "system" fn result_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        WM_CREATE => {
+            // Enable Acrylic/Mica Blur
+            let policy = DWM_SYSTEMBACKDROP_TYPE(2); // Mica
+            let _ = DwmSetWindowAttribute(
+                hwnd, 
+                DWMWA_SYSTEMBACKDROP_TYPE, 
+                &policy as *const _ as *const c_void, 
+                size_of::<DWM_SYSTEMBACKDROP_TYPE>() as u32
+            );
+            LRESULT(0)
+        }
+        // Close on Right Click, Left Click, or Escape
+        WM_RBUTTONUP | WM_LBUTTONUP => {
+            DestroyWindow(hwnd);
+            LRESULT(0)
+        }
+        WM_KEYDOWN => {
+            if wparam.0 == VK_ESCAPE.0 as usize {
+                DestroyWindow(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            
+            let mut rect = RECT::default();
+            GetClientRect(hwnd, &mut rect);
+
+            // Dark background fill
+            let brush = CreateSolidBrush(COLORREF(0x00101010)); 
+            FillRect(hdc, &rect, brush);
+            DeleteObject(brush);
+
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, COLORREF(0x00FFFFFF)); // White text
+            
+            // Use CreateFontW for Unicode support
+            let hfont = CreateFontW(
+                20, 0, 0, 0, FW_MEDIUM.0 as i32, 0, 0, 0, 
+                DEFAULT_CHARSET.0 as u32, 
+                OUT_DEFAULT_PRECIS.0 as u32, 
+                CLIP_DEFAULT_PRECIS.0 as u32, 
+                CLEARTYPE_QUALITY.0 as u32, 
+                (VARIABLE_PITCH.0 | FF_SWISS.0) as u32, 
+                w!("Segoe UI")
+            );
+            SelectObject(hdc, hfont);
+
+            // Retrieve text stored in window title
+            let len = GetWindowTextLengthW(hwnd) + 1;
+            let mut buf = vec![0u16; len as usize];
+            GetWindowTextW(hwnd, &mut buf);
+            
+            let mut draw_rect = rect;
+            draw_rect.left += 10;
+            draw_rect.top += 10;
+            draw_rect.right -= 10;
+            draw_rect.bottom -= 10;
+            
+            // DrawTextW for Unicode rendering
+            DrawTextW(hdc, &mut buf, &mut draw_rect, DT_LEFT | DT_WORDBREAK);
+
+            DeleteObject(hfont);
+            EndPaint(hwnd, &mut ps);
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+// --- LOGIC CONTROLLERS ---
+
+fn process_selection(app: Arc<Mutex<AppState>>, rect: RECT) {
+    let (img, config, _runtime, _client) = {
+        let guard = app.lock().unwrap();
+        (
+            guard.original_screenshot.clone().unwrap(),
+            guard.config.clone(),
+            (), 
+            guard.client.clone()
+        )
+    };
+
+    // Calculate crop coordinates relative to image buffer
+    let x_virt = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+    let y_virt = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+
+    let x_rel = rect.left - x_virt;
+    let y_rel = rect.top - y_virt;
+
+    let w = (rect.right - rect.left).abs() as u32;
+    let h = (rect.bottom - rect.top).abs() as u32;
+    let img_w = img.width();
+    let img_h = img.height();
+
+    let crop_x = x_rel.max(0) as u32;
+    let crop_y = y_rel.max(0) as u32;
+    let crop_w = w.min(img_w.saturating_sub(crop_x));
+    let crop_h = h.min(img_h.saturating_sub(crop_y));
+
+    if crop_w == 0 || crop_h == 0 {
+        println!("Invalid selection area");
+        return;
+    }
+    
+    let cropped = img.view(crop_x, crop_y, crop_w, crop_h).to_image();
+
+    let rt = Runtime::new().unwrap();
+    let translation_res = rt.block_on(translate_region(config.api_key, config.language, cropped));
+
+    match translation_res {
+        Ok(text) => {
+            if text.trim().is_empty() { return; }
+            // Spawn result window on the UI thread logic
+            std::thread::spawn(move || {
+                show_result_window(rect, text);
+            });
+        }
+        Err(e) => {
+            println!("Translation Error: {}", e);
+        }
+    }
+}
+
+fn show_selection_overlay() {
+    unsafe {
+        let instance = GetModuleHandleW(None).unwrap();
+        let class_name = w!("SnippingOverlay");
+        
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(selection_wnd_proc),
+            hInstance: instance,
+            hCursor: LoadCursorW(None, IDC_CROSS).unwrap(),
+            lpszClassName: class_name,
+            hbrBackground: CreateSolidBrush(COLORREF(0x00000000)),
+            ..Default::default()
+        };
+        RegisterClassW(&wc);
+
+        let x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        let w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        let h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        
+        SCREEN_OFFSET_X = x;
+        SCREEN_OFFSET_Y = y;
+
+        let hwnd = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            class_name,
+            w!("Snipping"),
+            WS_POPUP | WS_VISIBLE,
+            x, y, w, h,
+            None, None, instance, None
+        );
+
+        SetLayeredWindowAttributes(hwnd, COLORREF(0), 128, LWA_ALPHA); 
+
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).into() {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+            if msg.message == WM_CLOSE { break; }
+        }
+        
+        UnregisterClassW(class_name, instance);
+    }
+}
+
+fn show_result_window(target_rect: RECT, text: String) {
+    unsafe {
+        let instance = GetModuleHandleW(None).unwrap();
+        let class_name = w!("TranslationResult");
+        
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(result_wnd_proc),
+            hInstance: instance,
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap(),
+            lpszClassName: class_name,
+            style: CS_HREDRAW | CS_VREDRAW | CS_DROPSHADOW,
+            ..Default::default()
+        };
+        RegisterClassW(&wc);
+
+        // Calculate required height for text using GDI
+        let width = (target_rect.right - target_rect.left).abs();
+        // Enforce min width for readability
+        let width = width.max(200); 
+        
+        let mut calc_rect = RECT { left: 0, top: 0, right: width, bottom: 0 };
+        
+        // Temporary DC to calculate text size
+        let hdc = CreateCompatibleDC(None);
+        let hfont = CreateFontW(
+            20, 0, 0, 0, FW_MEDIUM.0 as i32, 0, 0, 0, 
+            DEFAULT_CHARSET.0 as u32, 
+            OUT_DEFAULT_PRECIS.0 as u32, 
+            CLIP_DEFAULT_PRECIS.0 as u32, 
+            CLEARTYPE_QUALITY.0 as u32, 
+            (VARIABLE_PITCH.0 | FF_SWISS.0) as u32, 
+            w!("Segoe UI")
+        );
+        SelectObject(hdc, hfont);
+        let text_wide = to_wstring(&text);
+        DrawTextW(hdc, &mut text_wide.clone(), &mut calc_rect, DT_CALCRECT | DT_WORDBREAK);
+        DeleteObject(hfont);
+        DeleteDC(hdc);
+
+        let height = (calc_rect.bottom - calc_rect.top) + 30; // Padding
+
+        let hwnd = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_LAYERED,
+            class_name,
+            PCWSTR(text_wide.as_ptr()), // Store text in title for retrieval
+            WS_POPUP | WS_VISIBLE,
+            target_rect.left, 
+            target_rect.top, 
+            width, 
+            height,
+            None, None, instance, None
+        );
+
+        SetLayeredWindowAttributes(hwnd, COLORREF(0), 240, LWA_ALPHA);
+
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).into() {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+            if !IsWindow(hwnd).as_bool() { break; }
+        }
+        UnregisterClassW(class_name, instance);
+    }
+}
+
+// --- MAIN ---
+
 fn main() {
+    prompt_user_config();
     let config = load_config();
-    if config.api_key.is_empty() {
-        run_config_prompt();
-    } else {
-        App::run(APP.clone()).expect("Failed to run app");
+    println!("=== Screen Translator Running ===");
+    println!("Press the Hotkey (Default: `) to select a region.");
+    println!("If the hotkey does not work outside the terminal, please run this app as Administrator.");
+    
+    unsafe {
+        let instance = GetModuleHandleW(None).unwrap();
+        let class_name = w!("HotkeyListener");
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(hotkey_proc),
+            hInstance: instance,
+            lpszClassName: class_name,
+            ..Default::default()
+        };
+        RegisterClassW(&wc);
+        
+        let hwnd = CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            class_name,
+            w!("Listener"),
+            WS_OVERLAPPEDWINDOW,
+            0, 0, 0, 0,
+            None, None, instance, None
+        );
+        
+        // Fix: Checked returns BOOL, use as_bool() or compare to FALSE
+        if !RegisterHotKey(hwnd, 1, HOT_KEY_MODIFIERS(0), config.hotkey).as_bool() {
+            println!("Error: Failed to register hotkey. Check if another app is using it.");
+        }
+
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).into() {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}
+
+unsafe extern "system" fn hotkey_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        WM_HOTKEY => {
+            if wparam.0 == 1 {
+                match capture_full_screen() {
+                    Ok((img, _x, _y)) => {
+                        {
+                            let mut app = APP.lock().unwrap();
+                            app.original_screenshot = Some(img);
+                        }
+                        std::thread::spawn(|| {
+                           show_selection_overlay(); 
+                        });
+                    },
+                    Err(e) => println!("Capture failed: {}", e)
+                }
+            }
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
