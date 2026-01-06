@@ -866,6 +866,11 @@ progressBar.onclick = (e) => {{
                     actual_streaming_enabled,
                     use_json,
                     move |chunk| {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u32)
+                            .unwrap_or(0);
+
                         let mut t = acc_clone_inner.lock().unwrap();
                         // Handle WIPE_SIGNAL - clear accumulator and use content after signal
                         if chunk.starts_with(crate::api::WIPE_SIGNAL) {
@@ -902,6 +907,14 @@ progressBar.onclick = (e) => {{
                                 let mut s = WINDOW_STATES.lock().unwrap();
                                 if let Some(st) = s.get_mut(&(h.0 as isize)) {
                                     st.is_refining = false;
+
+                                    // 200ms font recalc throttling during streaming
+                                    let time_since_last_calc =
+                                        now.wrapping_sub(st.last_font_calc_time);
+                                    if time_since_last_calc >= 200 || st.last_font_calc_time == 0 {
+                                        st.font_cache_dirty = true;
+                                        st.last_font_calc_time = now;
+                                    }
                                 }
                             }
                             update_window_text(h, &t);
@@ -927,6 +940,11 @@ progressBar.onclick = (e) => {{
                 search_label,
                 &config.ui_language,
                 |chunk| {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u32)
+                        .unwrap_or(0);
+
                     let mut t = acc_clone.lock().unwrap();
                     // Handle WIPE_SIGNAL - clear accumulator and use content after signal
                     if chunk.starts_with(crate::api::WIPE_SIGNAL) {
@@ -935,12 +953,20 @@ progressBar.onclick = (e) => {{
                     } else {
                         t.push_str(chunk);
                     }
+
                     if let Some(h) = my_hwnd {
                         {
                             let mut s = WINDOW_STATES.lock().unwrap();
                             if let Some(st) = s.get_mut(&(h.0 as isize)) {
                                 st.is_refining = false;
-                                st.font_cache_dirty = true;
+
+                                // 200ms font recalc throttling during streaming
+                                // Only recalculate font if 200ms has passed since last recalc
+                                let time_since_last_calc = now.wrapping_sub(st.last_font_calc_time);
+                                if time_since_last_calc >= 200 || st.last_font_calc_time == 0 {
+                                    st.font_cache_dirty = true;
+                                    st.last_font_calc_time = now;
+                                }
                             }
                         }
                         update_window_text(h, &t);

@@ -206,7 +206,20 @@ pub fn paint_window(hwnd: HWND) {
                 }
 
                 if state.last_w != width || state.last_h != height {
-                    state.font_cache_dirty = true;
+                    // Record resize time for debouncing
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u32)
+                        .unwrap_or(0);
+
+                    // RESIZE DEBOUNCE: Only recalculate font after resize stops for 100ms
+                    // This prevents expensive DrawTextW calls during active resize of large text
+                    let time_since_last_resize = now.wrapping_sub(state.last_resize_time);
+                    if time_since_last_resize > 100 || state.last_resize_time == 0 {
+                        state.font_cache_dirty = true;
+                    }
+                    // Always update resize time and dimensions
+                    state.last_resize_time = now;
                     state.last_w = width;
                     state.last_h = height;
                 }
@@ -413,6 +426,8 @@ pub fn paint_window(hwnd: HWND) {
                 let v_safety_margin = 0;
                 let available_h = (height - v_safety_margin).max(1);
 
+                let text_char_count = buf.len();
+
                 let mut low = if is_refining { 8 } else { 8 };
                 let max_possible = if is_refining {
                     18.min(available_h)
@@ -425,14 +440,18 @@ pub fn paint_window(hwnd: HWND) {
                 if high < low {
                     best_fit = low;
                 } else {
+                    // OPTIMIZATION: For large text, use coarser binary search steps
+                    // This reduces iterations without changing the final result
+                    let step_size = if text_char_count > 1000 { 2 } else { 1 };
+
                     while low <= high {
                         let mid = (low + high) / 2;
                         let (h, w) = measure_text_bounds(cache_dc, &mut buf, mid, available_w);
                         if h <= available_h && w <= available_w {
                             best_fit = mid;
-                            low = mid + 1;
+                            low = mid + step_size;
                         } else {
-                            high = mid - 1;
+                            high = mid - step_size;
                         }
                     }
                 }
