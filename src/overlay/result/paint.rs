@@ -44,12 +44,7 @@ unsafe fn measure_text_bounds(
     };
 
     // DT_EDITCONTROL helps simulate multiline text box behavior
-    DrawTextW(
-        hdc,
-        text,
-        &mut calc_rect,
-        DT_CALCRECT | DT_WORDBREAK | DT_EDITCONTROL,
-    );
+    DrawTextW(hdc, text, &mut calc_rect, DT_CALCRECT | DT_WORDBREAK);
 
     SelectObject(hdc, old_font);
     let _ = DeleteObject(hfont.into());
@@ -486,7 +481,7 @@ pub fn paint_window(hwnd: HWND) {
                     cache_dc,
                     &mut buf,
                     &mut measure_rect,
-                    DT_CALCRECT | DT_WORDBREAK | DT_EDITCONTROL,
+                    DT_CALCRECT | DT_WORDBREAK,
                 );
                 let text_h = measure_rect.bottom;
 
@@ -499,9 +494,9 @@ pub fn paint_window(hwnd: HWND) {
                 };
 
                 let draw_flags = if is_refining {
-                    DT_CENTER | DT_WORDBREAK | DT_EDITCONTROL
+                    DT_CENTER | DT_WORDBREAK
                 } else {
-                    DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL
+                    DT_LEFT | DT_WORDBREAK
                 };
                 DrawTextW(cache_dc, &mut buf, &mut draw_rect as *mut _, draw_flags);
 
